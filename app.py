@@ -3,6 +3,7 @@ import os
 import fitz  # PyMuPDF
 import google.generativeai as genai
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -24,7 +25,10 @@ try:
     api_key = st.secrets["GOOGLE_API_KEY"]
     genai.configure(api_key=api_key, transport='rest') 
 except FileNotFoundError:
-    st.error("Secrets file not found. Please check .streamlit/secrets.toml")
+    st.error("Secrets file not found. Please check your Streamlit Cloud Advanced Settings.")
+    st.stop()
+except KeyError:
+    st.error("🚨 API Key missing! Go to 'Advanced Settings' -> 'Secrets' and add: GOOGLE_API_KEY = \"your_key\"")
     st.stop()
 except Exception as e:
     st.error(f"API Error: {e}")
@@ -42,7 +46,7 @@ def evidence_is_clinically_acceptable(ev: EvidenceBundle) -> Tuple[bool, str]:
     missing = []
     if not ev.text_quote: missing.append("text_quote")
     if not ev.source_name: missing.append("source_name")
-    if not ev.page_snapshot_path: missing.append("page_snapshot_path") # Critical Gate
+    if not ev.page_snapshot_path: missing.append("page_snapshot_path") 
 
     if missing:
         return False, f"Missing evidence fields: {', '.join(missing)}"
@@ -63,19 +67,48 @@ def build_hallucination_safe_response(recommendation_text: str, ev: EvidenceBund
         "evidence": {"source": ev.source_name, "page_number": ev.page_number, "page_snapshot_path": ev.page_snapshot_path},
     }
 
-# --- 3. CORE LOGIC: PDF PROCESSING (Cached) ---
+# --- 3. CORE LOGIC: PDF PROCESSING (Now with Batching!) ---
 @st.cache_resource
 def load_and_index_pdf(pdf_path):
     if not os.path.exists(pdf_path): return None, None
     doc = fitz.open(pdf_path)
     documents = []
+    
+    # Extract text from pages
     for page_num, page in enumerate(doc):
         text = page.get_text()
         text_with_meta = f"[PAGE INDEX {page_num}]\n{text}"
         documents.append(Document(page_content=text_with_meta, metadata={"page": page_num}))
     
     embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=api_key, transport="rest")
-    vector_store = FAISS.from_documents(documents, embeddings)
+    
+    # --- BATCHING LOGIC STARTS HERE ---
+    # We process 10 pages at a time to prevent the "504 Deadline Exceeded" error
+    vector_store = None
+    batch_size = 10 
+    total_docs = len(documents)
+    
+    progress_text = "Initializing AI Brain... (This runs once)"
+    my_bar = st.progress(0, text=progress_text)
+
+    for i in range(0, total_docs, batch_size):
+        batch = documents[i : i + batch_size]
+        
+        if vector_store is None:
+            # Create the store with the first batch
+            vector_store = FAISS.from_documents(batch, embeddings)
+        else:
+            # Add subsequent batches to the existing store
+            vector_store.add_documents(batch)
+        
+        # Update progress bar
+        progress = min((i + batch_size) / total_docs, 1.0)
+        my_bar.progress(progress, text=f"Processing Protocol Pages {i} to {min(i+batch_size, total_docs)}...")
+        
+        # Tiny pause to be nice to the API
+        time.sleep(0.5)
+
+    my_bar.empty() # Hide progress bar when done
     return doc, vector_store
 
 # --- 4. DYNAMIC MODEL SELECTOR ---
@@ -89,13 +122,12 @@ def get_chat_model():
     except Exception:
         return ChatGoogleGenerativeAI(model="models/gemini-1.5-flash", temperature=0.1, google_api_key=api_key, transport="rest")
 
-# --- 5. SMART PAGE SELECTOR (ALL LOGIC MERGED) ---
+# --- 5. SMART PAGE SELECTOR ---
 def get_best_page_image(docs, user_query):
     best_page = None
     highest_score = -500 
     user_query = user_query.lower()
 
-    # --- A. DOSE-AWARE ROUTING (Weekly Chart Logic) ---
     if "weekly" in user_query and ("dose" in user_query or "chart" in user_query or "table" in user_query):
         match = re.search(r"(\d+(\.\d+)?)", user_query)
         if match:
@@ -107,62 +139,40 @@ def get_best_page_image(docs, user_query):
         else:
             return 53 
 
-    # --- B. CONVERSION ROUTING ---
     if any(x in user_query for x in ["switch", "convert", "transition", "dabigatran", "rivaroxaban", "apixaban"]): return 77
 
-    # --- C. INTENT DETECTION ---
     intent = "general"
-    
-    # 1. Reversal (Priority High)
-    if any(x in user_query for x in ["revers", "bleed", "supra", "vitamin k"]):
-        intent = "reversal"
-    elif re.search(r"\b([5-9]\.\d|1\d\.\d)\b", user_query): # Matches 5.0, 9.1, 10.5 etc
-        intent = "reversal"
-        
-    # 2. Maintenance / Subtherapeutic (Priority for INR < 2.0)
-    elif any(x in user_query for x in ["adjust", "maintenance", "subtherapeutic", "low", "increase", "target", "stable"]):
-        intent = "maintenance"
-    elif re.search(r"\b[0-4]\.\d\b", user_query): # Matches 0.9, 1.4, 1.8, up to 4.9 (unless bleeding context overrides)
-        intent = "maintenance"
-        
-    # 3. Initiation
-    elif any(x in user_query for x in ["initiat", "start", "begin", "new patient"]):
-        intent = "initiation"
+    if any(x in user_query for x in ["revers", "bleed", "supra", "vitamin k"]): intent = "reversal"
+    elif re.search(r"\b([5-9]\.\d|1\d\.\d)\b", user_query): intent = "reversal"
+    elif any(x in user_query for x in ["adjust", "maintenance", "subtherapeutic", "low", "increase", "target", "stable"]): intent = "maintenance"
+    elif re.search(r"\b[0-4]\.\d\b", user_query): intent = "maintenance"
+    elif any(x in user_query for x in ["initiat", "start", "begin", "new patient"]): intent = "initiation"
 
     tier_1_keywords = ["table 1", "table 2", "appendix 18", "appendix 19", "appendix 11", "appendix 12", "reversal", "initiation", "flow chart", "conversion"]
     ignore_keywords = ["checklist", "visit form", "referral form", "demographic", "appendix 1", "appendix 2", "appendix 3", "signature"]
 
-    # --- D. SCORING ---
     for i, doc in enumerate(docs):
         content = doc.page_content.lower()
         page_num = doc.metadata["page"]
-        
-        score = 80 - (i * 5) # Rank Decay
-        
+        score = 80 - (i * 5)
         if any(bad in content for bad in ignore_keywords): score -= 200
         if any(good in content for good in tier_1_keywords): score += 20
 
-        # INTENT SCORING
         if intent == "conversion":
             if "conversion" in content: score += 50
             if page_num == 77: score += 100
             if "reversal" in content: score -= 50
-
         elif intent == "initiation":
             if "initiation" in content or "start" in content: score += 50
             if "reversal" in content: score -= 50
             if page_num in [50, 51, 17]: score += 100
-
         elif intent == "reversal":
             if "reversal" in content or "bleed" in content: score += 50
             if "initiation" in content: score -= 50
             if page_num in [79, 80]: score += 150
-
         elif intent == "maintenance":
-            # REWARD: Maintenance pages (Page 31 = target INR, Page 50/51 = Dosing adjustment)
             if "maintenance" in content or "adjust" in content or "target" in content: score += 50
             if page_num in [31, 50, 51]: score += 150 
-            # PUNISH: Reversal page (We don't want Table 1 for INR 1.8)
             if page_num == 79: score -= 100 
 
         if score > highest_score:
@@ -171,7 +181,6 @@ def get_best_page_image(docs, user_query):
 
     if best_page is None and docs:
         best_page = docs[0].metadata["page"]
-        
     return best_page
 
 # --- 6. CLINICAL MATH ENGINE ---
@@ -214,20 +223,16 @@ if prompt := st.chat_input("Ask about Warfarin protocols (e.g., INR 7.2)..."):
         message_placeholder.markdown("Thinking...")
         
         try:
-            # 1. Retrieval
             results_with_scores = vector_store.similarity_search_with_score(prompt, k=12)
             docs = [doc for doc, score in results_with_scores]
 
-            # 2. Force-Feed Page 77 for Conversion
             if any(x in prompt.lower() for x in ["switch", "convert", "transition", "dabigatran", "rivaroxaban", "apixaban"]):
                 page_77_content = pdf_doc.load_page(77).get_text()
                 docs.insert(0, Document(page_content=f"[PAGE INDEX 77 - APPENDIX 18 CONVERSION]\n{page_77_content}", metadata={"page": 77}))
             
-            # 3. Select Target Page
             target_page = get_best_page_image(docs, prompt)
             math_context = calculate_dosing_schedule(prompt)
             
-            # 4. Generate
             chain = load_qa_chain(get_chat_model(), chain_type="stuff")
             custom_prompt = f"""
             You are a clinical pharmacist assistant. 
@@ -252,7 +257,6 @@ if prompt := st.chat_input("Ask about Warfarin protocols (e.g., INR 7.2)..."):
             chain.llm_chain.prompt = PROMPT
             ai_text_response = chain.run(input_documents=docs, question=prompt)
 
-            # 5. Build Safety Bundle
             evidence_bundle = EvidenceBundle(
                 text_quote=ai_text_response,
                 source_name=PDF_FILE,
@@ -260,7 +264,6 @@ if prompt := st.chat_input("Ask about Warfarin protocols (e.g., INR 7.2)..."):
                 page_snapshot_path=f"Page {target_page}" if target_page is not None else None
             )
 
-            # 6. Render
             final_response = build_hallucination_safe_response(ai_text_response, evidence_bundle)
 
             if final_response["status"] == "OK":
