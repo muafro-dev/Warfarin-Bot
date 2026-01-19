@@ -12,6 +12,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
 from langchain.chains.question_answering import load_qa_chain
 from langchain.docstore.document import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter # NEW: The "Knife" to cut text
 
 # --- CONFIGURATION ---
 PAGE_TITLE = "Clinical Warfarin Bot"
@@ -67,48 +68,63 @@ def build_hallucination_safe_response(recommendation_text: str, ev: EvidenceBund
         "evidence": {"source": ev.source_name, "page_number": ev.page_number, "page_snapshot_path": ev.page_snapshot_path},
     }
 
-# --- 3. CORE LOGIC: PDF PROCESSING (Now with Batching!) ---
+# --- 3. CORE LOGIC: PDF PROCESSING (With Chunking & Retries) ---
 @st.cache_resource
 def load_and_index_pdf(pdf_path):
     if not os.path.exists(pdf_path): return None, None
     doc = fitz.open(pdf_path)
-    documents = []
+    raw_documents = []
     
-    # Extract text from pages
+    # 1. Read Pages
     for page_num, page in enumerate(doc):
         text = page.get_text()
         text_with_meta = f"[PAGE INDEX {page_num}]\n{text}"
-        documents.append(Document(page_content=text_with_meta, metadata={"page": page_num}))
+        raw_documents.append(Document(page_content=text_with_meta, metadata={"page": page_num}))
     
+    # 2. Split Pages into Smaller Chunks (The Fix for 504 Error)
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=2000, # Safe size for Google API
+        chunk_overlap=200 # Overlap to keep context
+    )
+    final_documents = text_splitter.split_documents(raw_documents)
+
     embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=api_key, transport="rest")
     
-    # --- BATCHING LOGIC STARTS HERE ---
-    # We process 10 pages at a time to prevent the "504 Deadline Exceeded" error
+    # 3. Batch Process with Retry Logic
     vector_store = None
-    batch_size = 10 
-    total_docs = len(documents)
+    batch_size = 5 # Very safe batch size
+    total_docs = len(final_documents)
     
-    progress_text = "Initializing AI Brain... (This runs once)"
+    progress_text = "Initializing AI Brain... Processing Protocols..."
     my_bar = st.progress(0, text=progress_text)
 
     for i in range(0, total_docs, batch_size):
-        batch = documents[i : i + batch_size]
+        batch = final_documents[i : i + batch_size]
         
-        if vector_store is None:
-            # Create the store with the first batch
-            vector_store = FAISS.from_documents(batch, embeddings)
-        else:
-            # Add subsequent batches to the existing store
-            vector_store.add_documents(batch)
+        # Simple Retry Loop
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if vector_store is None:
+                    vector_store = FAISS.from_documents(batch, embeddings)
+                else:
+                    vector_store.add_documents(batch)
+                break # Success, exit retry loop
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(2) # Wait 2 seconds before retrying
+                else:
+                    st.error(f"Failed to process batch {i}. Error: {e}")
+                    # Continue anyway to salvage what we can
         
         # Update progress bar
         progress = min((i + batch_size) / total_docs, 1.0)
-        my_bar.progress(progress, text=f"Processing Protocol Pages {i} to {min(i+batch_size, total_docs)}...")
+        my_bar.progress(progress, text=f"Processing Segment {i} of {total_docs}...")
         
-        # Tiny pause to be nice to the API
-        time.sleep(0.5)
+        # Friendly pause for the API
+        time.sleep(0.2)
 
-    my_bar.empty() # Hide progress bar when done
+    my_bar.empty()
     return doc, vector_store
 
 # --- 4. DYNAMIC MODEL SELECTOR ---
@@ -180,106 +196,4 @@ def get_best_page_image(docs, user_query):
             best_page = page_num
 
     if best_page is None and docs:
-        best_page = docs[0].metadata["page"]
-    return best_page
-
-# --- 6. CLINICAL MATH ENGINE ---
-def calculate_dosing_schedule(query):
-    match = re.search(r"(\d+)(?:\s*)mg", query.lower())
-    if not match: return ""
-    total_dose = int(match.group(1))
-    base_daily = total_dose // 7
-    remainder = total_dose % 7
-    return f"\n\n[CALCULATED REFERENCE]: User asked for {total_dose}mg Weekly. Calculation: {base_daily}mg daily, with {base_daily + 1}mg on {remainder} days."
-
-# --- 7. UI & CHAT LOGIC ---
-st.title(f"{ICON} {PAGE_TITLE}")
-st.markdown("##### *\"...And whoever saves one—it is as if he had saved mankind entirely.\"*")
-st.caption("Local RAG · Hallucination-Safe · Protocol Finder")
-
-if "messages" not in st.session_state: st.session_state.messages = []
-
-pdf_doc, vector_store = load_and_index_pdf(PDF_FILE)
-if not pdf_doc:
-    st.error(f"PDF file '{PDF_FILE}' not found.")
-    st.stop()
-
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        if "image_page" in message and message["image_page"] is not None:
-            page_idx = message["image_page"]
-            page = pdf_doc.load_page(page_idx)
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            st.image(pix.tobytes("png"), caption=f"Verified Source: Page Index {message['image_page']}", width=700)
-
-if prompt := st.chat_input("Ask about Warfarin protocols (e.g., INR 7.2)..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        message_placeholder.markdown("Thinking...")
-        
-        try:
-            results_with_scores = vector_store.similarity_search_with_score(prompt, k=12)
-            docs = [doc for doc, score in results_with_scores]
-
-            if any(x in prompt.lower() for x in ["switch", "convert", "transition", "dabigatran", "rivaroxaban", "apixaban"]):
-                page_77_content = pdf_doc.load_page(77).get_text()
-                docs.insert(0, Document(page_content=f"[PAGE INDEX 77 - APPENDIX 18 CONVERSION]\n{page_77_content}", metadata={"page": 77}))
-            
-            target_page = get_best_page_image(docs, prompt)
-            math_context = calculate_dosing_schedule(prompt)
-            
-            chain = load_qa_chain(get_chat_model(), chain_type="stuff")
-            custom_prompt = f"""
-            You are a clinical pharmacist assistant. 
-            USER SCENARIO: {{question}}
-            {math_context} 
-            CONTEXT: {{context}}
-            INSTRUCTIONS:
-            1. Switching: Look for Appendix 18 (Page 77).
-            2. Reversal: Capture primary (Omit) and alternatives (Vitamin K).
-            3. Initiation: Look for "3mg then 2mg".
-            4. Maintenance (Low INR): Increase dose by percentage (Page 50/51).
-            5. Weekly Dosing: If chart text is missing, use [CALCULATED REFERENCE] but refer to the snapshot.
-            
-            CRITICAL: DO NOT type out the text of the table/snapshot. The user will see the actual image. Just refer to it.
-            
-            RESPONSE FORMAT:
-            1. Action Plan.
-            2. Citation: "Protocol identified on **Page Index {target_page}**."
-            3. Verification: "Please verify the details in the snapshot below."
-            """
-            PROMPT = PromptTemplate(template=custom_prompt, input_variables=["context", "question"])
-            chain.llm_chain.prompt = PROMPT
-            ai_text_response = chain.run(input_documents=docs, question=prompt)
-
-            evidence_bundle = EvidenceBundle(
-                text_quote=ai_text_response,
-                source_name=PDF_FILE,
-                page_number=target_page,
-                page_snapshot_path=f"Page {target_page}" if target_page is not None else None
-            )
-
-            final_response = build_hallucination_safe_response(ai_text_response, evidence_bundle)
-
-            if final_response["status"] == "OK":
-                message_placeholder.markdown(final_response["recommendation"])
-                if target_page is not None:
-                    page = pdf_doc.load_page(target_page) 
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                    st.image(pix.tobytes("png"), caption=f"Verified Source: Page Index {target_page}", width=700)
-                st.session_state.messages.append({"role": "assistant", "content": final_response["recommendation"], "image_page": target_page})
-            else:
-                message_placeholder.error(final_response["message"])
-                with st.expander("Why blocked?"): st.write(final_response["why"])
-
-        except Exception as e:
-            error_msg = str(e)
-            if "429" in error_msg or "ResourceExhausted" in error_msg:
-                message_placeholder.error("🚨 **Rate Limit Hit (429):** Too many requests. Please wait 1 minute.")
-            else:
-                message_placeholder.error(f"An error occurred: {error_msg}")
+        best_page = docs
