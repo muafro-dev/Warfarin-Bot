@@ -84,7 +84,6 @@ def load_and_index_pdf(pdf_path):
         raw_documents.append(Document(page_content=text_with_meta, metadata={"page": page_num}))
     
     # 2. Split Pages into Smaller Chunks (Fixes 504 Errors)
-    # We use a safe chunk size that won't overwhelm the API
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=2000, 
         chunk_overlap=200
@@ -104,7 +103,7 @@ def load_and_index_pdf(pdf_path):
     for i in range(0, total_docs, batch_size):
         batch = final_documents[i : i + batch_size]
         
-        # Simple Retry Loop to handle potential network blips
+        # Simple Retry Loop
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -117,7 +116,6 @@ def load_and_index_pdf(pdf_path):
                 if attempt < max_retries - 1:
                     time.sleep(2) # Wait 2 seconds before retrying
                 else:
-                    # Log error but don't crash the whole app if one batch fails
                     print(f"Failed to process batch {i}. Error: {e}")
         
         # Update progress bar
@@ -245,6 +243,7 @@ if prompt := st.chat_input("Ask about Warfarin protocols (e.g., INR 7.2)..."):
             results_with_scores = vector_store.similarity_search_with_score(prompt, k=12)
             docs = [doc for doc, score in results_with_scores]
 
+            # Force-Feed Page 77 for Conversion queries
             if any(x in prompt.lower() for x in ["switch", "convert", "transition", "dabigatran", "rivaroxaban", "apixaban"]):
                 page_77_content = pdf_doc.load_page(77).get_text()
                 docs.insert(0, Document(page_content=f"[PAGE INDEX 77 - APPENDIX 18 CONVERSION]\n{page_77_content}", metadata={"page": 77}))
@@ -287,11 +286,27 @@ if prompt := st.chat_input("Ask about Warfarin protocols (e.g., INR 7.2)..."):
 
             if final_response["status"] == "OK":
                 message_placeholder.markdown(final_response["recommendation"])
-                if target_page is not None:
+                
+                # --- NEW LOGIC: CONDITIONAL IMAGE DISPLAY ---
+                show_image = True
+                
+                # If the bot is refusing or can't find info, don't show a random page
+                lower_response = final_response["recommendation"].lower()
+                if "does not contain" in lower_response:
+                    show_image = False
+                if "cannot provide a recommendation" in lower_response:
+                    show_image = False
+                if "unable to find" in lower_response:
+                    show_image = False
+
+                if target_page is not None and show_image:
                     page = pdf_doc.load_page(target_page) 
                     pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
                     st.image(pix.tobytes("png"), caption=f"Verified Source: Page Index {target_page}", width=700)
-                st.session_state.messages.append({"role": "assistant", "content": final_response["recommendation"], "image_page": target_page})
+                    st.session_state.messages.append({"role": "assistant", "content": final_response["recommendation"], "image_page": target_page})
+                else:
+                    # Save response to history WITHOUT the image
+                    st.session_state.messages.append({"role": "assistant", "content": final_response["recommendation"], "image_page": None})
             else:
                 message_placeholder.error(final_response["message"])
                 with st.expander("Why blocked?"): st.write(final_response["why"])
