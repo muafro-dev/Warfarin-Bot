@@ -60,7 +60,7 @@ def build_hallucination_safe_response(recommendation_text: str, ev: EvidenceBund
     if not ok:
         return {
             "status": "REFUSE",
-            "message": "⚠️ **Safety Check Failed:** I cannot provide a recommendation because the supporting protocol page could not be verified. Please escalate to a clinician.",
+            "message": "⚠️ **Safety Check Failed:** I cannot provide a recommendation because the supporting protocol page could not be verified.",
             "why": reason,
             "evidence": ev.__dict__,
         }
@@ -83,7 +83,7 @@ def load_and_index_pdf(pdf_path):
         text_with_meta = f"[PAGE INDEX {page_num}]\n{text}"
         raw_documents.append(Document(page_content=text_with_meta, metadata={"page": page_num}))
     
-    # 2. Split Pages into Smaller Chunks (Fixes 504 Errors)
+    # 2. Split Pages into Smaller Chunks
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=2000, 
         chunk_overlap=200
@@ -92,9 +92,9 @@ def load_and_index_pdf(pdf_path):
 
     embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=api_key, transport="rest")
     
-    # 3. Batch Process with Retry Logic
+    # 3. Batch Process
     vector_store = None
-    batch_size = 5 # Process 5 chunks at a time
+    batch_size = 5 
     total_docs = len(final_documents)
     
     progress_text = "Initializing AI Brain... Processing Protocols..."
@@ -102,8 +102,6 @@ def load_and_index_pdf(pdf_path):
 
     for i in range(0, total_docs, batch_size):
         batch = final_documents[i : i + batch_size]
-        
-        # Simple Retry Loop
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -111,18 +109,15 @@ def load_and_index_pdf(pdf_path):
                     vector_store = FAISS.from_documents(batch, embeddings)
                 else:
                     vector_store.add_documents(batch)
-                break # Success, exit retry loop
+                break 
             except Exception as e:
                 if attempt < max_retries - 1:
-                    time.sleep(2) # Wait 2 seconds before retrying
+                    time.sleep(2)
                 else:
                     print(f"Failed to process batch {i}. Error: {e}")
         
-        # Update progress bar
         progress = min((i + batch_size) / total_docs, 1.0)
         my_bar.progress(progress, text=f"Processing Segment {i} of {total_docs}...")
-        
-        # Friendly pause for the API
         time.sleep(0.2)
 
     my_bar.empty()
@@ -135,9 +130,9 @@ def get_chat_model():
         valid_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         target_models = ["models/gemini-1.5-pro", "models/gemini-1.5-pro-latest", "models/gemini-pro"]
         selected_model = next((m for m in target_models if m in valid_models), valid_models[0])
-        return ChatGoogleGenerativeAI(model=selected_model, temperature=0.1, google_api_key=api_key, transport="rest")
+        return ChatGoogleGenerativeAI(model=selected_model, temperature=0.0, google_api_key=api_key, transport="rest")
     except Exception:
-        return ChatGoogleGenerativeAI(model="models/gemini-1.5-flash", temperature=0.1, google_api_key=api_key, transport="rest")
+        return ChatGoogleGenerativeAI(model="models/gemini-1.5-flash", temperature=0.0, google_api_key=api_key, transport="rest")
 
 # --- 5. SMART PAGE SELECTOR ---
 def get_best_page_image(docs, user_query):
@@ -175,6 +170,7 @@ def get_best_page_image(docs, user_query):
         if any(bad in content for bad in ignore_keywords): score -= 200
         if any(good in content for good in tier_1_keywords): score += 20
 
+        # UPDATED SCORING LOGIC (Less Aggressive)
         if intent == "conversion":
             if "conversion" in content: score += 50
             if page_num == 77: score += 100
@@ -189,7 +185,8 @@ def get_best_page_image(docs, user_query):
             if page_num in [79, 80]: score += 150
         elif intent == "maintenance":
             if "maintenance" in content or "adjust" in content or "target" in content: score += 50
-            if page_num in [31, 50, 51]: score += 150 
+            # REMOVED THE HARD +150 SCORE FOR PAGE 31 TO PREVENT FALSE MATCHES
+            if page_num in [31, 50, 51]: score += 50 
             if page_num == 79: score -= 100 
 
         if score > highest_score:
@@ -243,7 +240,6 @@ if prompt := st.chat_input("Ask about Warfarin protocols (e.g., INR 7.2)..."):
             results_with_scores = vector_store.similarity_search_with_score(prompt, k=12)
             docs = [doc for doc, score in results_with_scores]
 
-            # Force-Feed Page 77 for Conversion queries
             if any(x in prompt.lower() for x in ["switch", "convert", "transition", "dabigatran", "rivaroxaban", "apixaban"]):
                 page_77_content = pdf_doc.load_page(77).get_text()
                 docs.insert(0, Document(page_content=f"[PAGE INDEX 77 - APPENDIX 18 CONVERSION]\n{page_77_content}", metadata={"page": 77}))
@@ -252,19 +248,25 @@ if prompt := st.chat_input("Ask about Warfarin protocols (e.g., INR 7.2)..."):
             math_context = calculate_dosing_schedule(prompt)
             
             chain = load_qa_chain(get_chat_model(), chain_type="stuff")
+            
+            # --- STRICT PROMPT TO PREVENT HALLUCINATION ---
             custom_prompt = f"""
-            You are a clinical pharmacist assistant. 
+            You are a clinical pharmacist assistant based ONLY on the provided protocol.
+            
+            STRICT RULES:
+            1. Answer ONLY using the information in the CONTEXT below.
+            2. If the answer is not explicitly written in the CONTEXT, you MUST say: "The provided protocol does not contain information about [topic]."
+            3. DO NOT use outside medical knowledge (e.g. do not guess INR targets for conditions not mentioned in the text).
+            
             USER SCENARIO: {{question}}
             {math_context} 
             CONTEXT: {{context}}
-            INSTRUCTIONS:
+            
+            INSTRUCTIONS IF FOUND:
             1. Switching: Look for Appendix 18 (Page 77).
             2. Reversal: Capture primary (Omit) and alternatives (Vitamin K).
             3. Initiation: Look for "3mg then 2mg".
-            4. Maintenance (Low INR): Increase dose by percentage (Page 50/51).
-            5. Weekly Dosing: If chart text is missing, use [CALCULATED REFERENCE] but refer to the snapshot.
-            
-            CRITICAL: DO NOT type out the text of the table/snapshot. The user will see the actual image. Just refer to it.
+            4. Maintenance: Increase dose by percentage (Page 50/51).
             
             RESPONSE FORMAT:
             1. Action Plan.
@@ -287,16 +289,14 @@ if prompt := st.chat_input("Ask about Warfarin protocols (e.g., INR 7.2)..."):
             if final_response["status"] == "OK":
                 message_placeholder.markdown(final_response["recommendation"])
                 
-                # --- NEW LOGIC: CONDITIONAL IMAGE DISPLAY ---
+                # --- LOGIC: HIDE IMAGE IF NOT FOUND ---
                 show_image = True
-                
-                # If the bot is refusing or can't find info, don't show a random page
                 lower_response = final_response["recommendation"].lower()
-                if "does not contain" in lower_response:
+                
+                # Keywords that indicate the bot failed to find the answer
+                if "does not contain" in lower_response or "not mentioned" in lower_response:
                     show_image = False
-                if "cannot provide a recommendation" in lower_response:
-                    show_image = False
-                if "unable to find" in lower_response:
+                if "cannot provide" in lower_response or "unable to find" in lower_response:
                     show_image = False
 
                 if target_page is not None and show_image:
@@ -305,7 +305,6 @@ if prompt := st.chat_input("Ask about Warfarin protocols (e.g., INR 7.2)..."):
                     st.image(pix.tobytes("png"), caption=f"Verified Source: Page Index {target_page}", width=700)
                     st.session_state.messages.append({"role": "assistant", "content": final_response["recommendation"], "image_page": target_page})
                 else:
-                    # Save response to history WITHOUT the image
                     st.session_state.messages.append({"role": "assistant", "content": final_response["recommendation"], "image_page": None})
             else:
                 message_placeholder.error(final_response["message"])
