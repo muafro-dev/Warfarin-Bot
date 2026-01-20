@@ -60,7 +60,7 @@ def build_hallucination_safe_response(recommendation_text: str, ev: EvidenceBund
     if not ok:
         return {
             "status": "REFUSE",
-            "message": "⚠️ **Safety Check Failed:** I cannot provide a recommendation because the supporting protocol page could not be verified.",
+            "message": "⚠️ **Safety Check Failed:** I cannot provide a recommendation because the supporting protocol page could not be verified. Please escalate to a clinician.",
             "why": reason,
             "evidence": ev.__dict__,
         }
@@ -170,7 +170,6 @@ def get_best_page_image(docs, user_query):
         if any(bad in content for bad in ignore_keywords): score -= 200
         if any(good in content for good in tier_1_keywords): score += 20
 
-        # UPDATED SCORING LOGIC (Less Aggressive)
         if intent == "conversion":
             if "conversion" in content: score += 50
             if page_num == 77: score += 100
@@ -185,7 +184,6 @@ def get_best_page_image(docs, user_query):
             if page_num in [79, 80]: score += 150
         elif intent == "maintenance":
             if "maintenance" in content or "adjust" in content or "target" in content: score += 50
-            # REMOVED THE HARD +150 SCORE FOR PAGE 31 TO PREVENT FALSE MATCHES
             if page_num in [31, 50, 51]: score += 50 
             if page_num == 79: score -= 100 
 
@@ -249,14 +247,13 @@ if prompt := st.chat_input("Ask about Warfarin protocols (e.g., INR 7.2)..."):
             
             chain = load_qa_chain(get_chat_model(), chain_type="stuff")
             
-            # --- STRICT PROMPT TO PREVENT HALLUCINATION ---
             custom_prompt = f"""
             You are a clinical pharmacist assistant based ONLY on the provided protocol.
             
             STRICT RULES:
             1. Answer ONLY using the information in the CONTEXT below.
             2. If the answer is not explicitly written in the CONTEXT, you MUST say: "The provided protocol does not contain information about [topic]."
-            3. DO NOT use outside medical knowledge (e.g. do not guess INR targets for conditions not mentioned in the text).
+            3. DO NOT use outside medical knowledge.
             
             USER SCENARIO: {{question}}
             {math_context} 
@@ -289,15 +286,20 @@ if prompt := st.chat_input("Ask about Warfarin protocols (e.g., INR 7.2)..."):
             if final_response["status"] == "OK":
                 message_placeholder.markdown(final_response["recommendation"])
                 
-                # --- LOGIC: HIDE IMAGE IF NOT FOUND ---
+                # --- SMARTER IMAGE LOGIC ---
                 show_image = True
                 lower_response = final_response["recommendation"].lower()
                 
-                # Keywords that indicate the bot failed to find the answer
+                # 1. Check for negative phrases
                 if "does not contain" in lower_response or "not mentioned" in lower_response:
                     show_image = False
                 if "cannot provide" in lower_response or "unable to find" in lower_response:
                     show_image = False
+                
+                # 2. OVERRIDE: If an Action Plan was actually generated, SHOW THE IMAGE.
+                # This handles cases where the bot answers "Part A" but says "I don't have Part B".
+                if "action plan" in lower_response:
+                    show_image = True
 
                 if target_page is not None and show_image:
                     page = pdf_doc.load_page(target_page) 
