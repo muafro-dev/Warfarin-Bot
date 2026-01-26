@@ -75,12 +75,18 @@ def load_and_index_pdf(pdf_path):
     my_bar.empty()
     return doc, vector_store
 
-# --- 3. MODEL SETUP ---
+# --- 3. MODEL SETUP (FIXED: Switched to Flash) ---
 @st.cache_resource
 def get_chat_model():
-    return ChatGoogleGenerativeAI(model="models/gemini-1.5-pro", temperature=0.0, google_api_key=api_key, transport="rest")
+    # 'gemini-1.5-flash' is the most stable current model
+    return ChatGoogleGenerativeAI(
+        model="gemini-1.5-flash", 
+        temperature=0.0, 
+        google_api_key=api_key, 
+        transport="rest"
+    )
 
-# --- 4. NEW: CITATION EXTRACTOR ---
+# --- 4. CITATION EXTRACTOR ---
 def extract_page_from_answer(answer_text):
     # Looks for "Page Index 31" or "Page 31" in the AI's own answer
     match = re.search(r"Page (?:Index )?(\d+)", answer_text, re.IGNORECASE)
@@ -120,8 +126,7 @@ if prompt := st.chat_input("Ask about Warfarin protocols..."):
 
             chain = load_qa_chain(get_chat_model(), chain_type="stuff")
             
-            # --- THE "STOLEN" PROMPT STRATEGY ---
-            # We explicitly ask the AI to cite the [PAGE INDEX] it sees in the text.
+            # --- THE PROMPT STRATEGY ---
             custom_prompt = """
             You are a clinical pharmacist assistant based ONLY on the provided protocol.
             
@@ -142,15 +147,14 @@ if prompt := st.chat_input("Ask about Warfarin protocols..."):
             chain.llm_chain.prompt = PROMPT
             response = chain.run(input_documents=docs, question=prompt)
 
-            # --- NEW LOGIC: TRUST THE AI'S CITATION ---
-            # Instead of guessing with Python, we extract the page number the AI wrote.
+            # --- CITATION LOGIC ---
             cited_page = extract_page_from_answer(response)
             
             # Hallucination Check
             show_image = True
             if "does not contain" in response.lower() or "not found" in response.lower():
                 show_image = False
-                cited_page = None # Reset page if answer is negative
+                cited_page = None 
 
             message_placeholder.markdown(response)
             
@@ -161,7 +165,6 @@ if prompt := st.chat_input("Ask about Warfarin protocols..."):
                     st.image(pix.tobytes("png"), caption=f"Source: Page {cited_page}", width=700)
                     st.session_state.messages.append({"role": "assistant", "content": response, "image_page": cited_page})
                 except:
-                    # Fallback if AI cites a non-existent page
                     st.session_state.messages.append({"role": "assistant", "content": response, "image_page": None})
             else:
                 st.session_state.messages.append({"role": "assistant", "content": response, "image_page": None})
