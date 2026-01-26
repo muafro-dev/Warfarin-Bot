@@ -41,7 +41,7 @@ def load_and_index_pdf(pdf_path):
     doc = fitz.open(pdf_path)
     raw_documents = []
     
-    # We inject the Page Number directly into the text so the AI can "See" it
+    # Inject Page Numbers
     for page_num, page in enumerate(doc):
         text = page.get_text()
         text_with_meta = f"[PAGE INDEX {page_num}]\n{text}"
@@ -50,7 +50,8 @@ def load_and_index_pdf(pdf_path):
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
     final_documents = text_splitter.split_documents(raw_documents)
 
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=api_key, transport="rest")
+    # Use a very generic embedding model to avoid 404s
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=api_key)
     
     vector_store = None
     batch_size = 5 
@@ -74,50 +75,46 @@ def load_and_index_pdf(pdf_path):
     my_bar.empty()
     return doc, vector_store
 
-# --- 3. DYNAMIC MODEL SELECTOR (SELF-HEALING) ---
+# --- 3. DYNAMIC MODEL SELECTOR (UPDATED LIST) ---
 @st.cache_resource
 def get_chat_model():
     """
-    Dynamically tests available models and selects the first one that works.
+    Tests specific stable model versions.
     """
-    # Priority list: Newest/Fastest -> Oldest/Stable
+    # UPDATED PRIORITY LIST (Specific versions are more stable)
     candidate_models = [
         "gemini-1.5-flash",
-        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash-001",
+        "gemini-1.5-flash-002",
         "gemini-1.5-pro",
-        "gemini-1.5-pro-latest",
+        "gemini-1.5-pro-001",
+        "gemini-1.0-pro",
         "gemini-pro"
     ]
     
     selected_model_name = None
-    
     print("🔄 Testing Gemini Models...")
     
     for model_name in candidate_models:
         try:
-            # Test the model with a tiny ping
             test_llm = ChatGoogleGenerativeAI(
                 model=model_name, 
                 temperature=0.0, 
                 google_api_key=api_key, 
                 transport="rest"
             )
-            # Invoke with a dummy string to check connectivity
-            test_llm.invoke("Hello")
-            
-            # If we get here, it worked!
+            test_llm.invoke("Hi")
             selected_model_name = model_name
             print(f"✅ Success! Connected to: {model_name}")
             break
         except Exception as e:
-            print(f"❌ Failed: {model_name} - Error: {str(e)}")
+            print(f"❌ Failed: {model_name}")
             continue
 
     if selected_model_name is None:
-        st.error("🚨 Critical Error: Could not connect to ANY Gemini models. Check your API Key or Quota.")
+        st.error("🚨 Critical Error: Could not connect to any Gemini models. Please check your API Key.")
         st.stop()
 
-    # Return the validated model
     return ChatGoogleGenerativeAI(
         model=selected_model_name, 
         temperature=0.0, 
@@ -134,7 +131,7 @@ def extract_page_from_answer(answer_text):
 
 # --- 5. UI & CHAT ---
 st.title(f"{ICON} {PAGE_TITLE}")
-st.caption("Local RAG · Hallucination-Safe · Dynamic Model Selection")
+st.caption("Local RAG · Hallucination-Safe · Citation-Based Retrieval")
 
 if "messages" not in st.session_state: st.session_state.messages = []
 
@@ -164,24 +161,26 @@ if prompt := st.chat_input("Ask about Warfarin protocols..."):
 
             chain = load_qa_chain(get_chat_model(), chain_type="stuff")
             
-            # --- PROMPT STRATEGY ---
-            custom_prompt = """
+            # --- PROMPT (Fixed Syntax) ---
+            # We use distinct strings to avoid SyntaxErrors during copy-paste
+            p_instructions = """
             You are a clinical pharmacist assistant based ONLY on the provided protocol.
             
             STRICT RULES:
             1. Answer ONLY using the information in the CONTEXT.
             2. The Context contains markers like [PAGE INDEX 12]. You MUST cite this number.
             3. If the answer is not found, say "The protocol does not contain this information."
+            """
             
-            CONTEXT: {context}
-            USER QUESTION: {question}
-            
+            p_format = """
             RESPONSE FORMAT:
             1. Direct Answer.
             2. SOURCE: "Reference found on Page Index [Insert Number Here]"
             """
             
-            PROMPT = PromptTemplate(template=custom_prompt, input_variables=["context", "question"])
+            full_template = p_instructions + "\nCONTEXT: {context}\nUSER QUESTION: {question}\n" + p_format
+            
+            PROMPT = PromptTemplate(template=full_template, input_variables=["context", "question"])
             chain.llm_chain.prompt = PROMPT
             response = chain.run(input_documents=docs, question=prompt)
 
