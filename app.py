@@ -52,10 +52,8 @@ except Exception as e:
 # If a supported genai client is available, configure it (best-effort)
 if GENAI_CLIENT == "genai_new":
     try:
-        # configure new client (API differs by version; this is a safe best-effort)
         genai_new.configure(api_key=api_key)
     except Exception:
-        # not fatal here; model init will show clearer error later
         pass
 elif GENAI_CLIENT == "genai_old":
     try:
@@ -108,18 +106,15 @@ def load_and_index_pdf(pdf_path):
     return doc, vector_store
 
 # --- 3. MODEL SETUP (SAFE) ---
-# We will not crash on import; instead we try to initialize and show helpful errors.
 @st.cache_resource
 def get_chat_model(model_name="gemini-1.5-flash"):
     try:
-        # Use LangChain wrapper; it will raise if model name or API is unsupported.
         return ChatGoogleGenerativeAI(
             model=model_name,
             temperature=0.0,
             google_api_key=api_key
         )
     except Exception as e:
-        # Re-raise with a clearer message for the UI
         raise RuntimeError(
             "Model initialization failed. This can happen if the model name is not supported "
             "by your Google account or the client library. Original error: " + str(e)
@@ -136,10 +131,10 @@ def extract_page_from_answer(answer_text):
 st.title(f"{ICON} {PAGE_TITLE}")
 st.caption("Local RAG · Hallucination-Safe · Citation-Based Retrieval")
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# Sidebar: model settings so you can try different model names without editing code
+st.sidebar.header("Model settings")
+model_name = st.sidebar.text_input("Model name", value="gemini-1.5-flash")
 
-# Show a small diagnostics panel (non-sensitive)
 with st.expander("Diagnostics (click to expand)"):
     st.write("GenAI client detected:", GENAI_CLIENT)
     st.write("Model wrapper: langchain-google-genai ChatGoogleGenerativeAI")
@@ -147,13 +142,11 @@ with st.expander("Diagnostics (click to expand)"):
     st.write("If model initialization fails, use the 'List available models' button below to see supported model names.")
 
     if st.button("List available models (best-effort)"):
-        # Try to list models using whichever client is available
         try:
             if GENAI_CLIENT == "genai_new":
                 models = genai_new.list_models()
                 st.write([m.name for m in models])
             elif GENAI_CLIENT == "genai_old":
-                # older client may not have list_models; attempt best-effort
                 try:
                     models = genai_old.list_models()
                     st.write([m.name for m in models])
@@ -168,6 +161,9 @@ pdf_doc, vector_store = load_and_index_pdf(PDF_FILE)
 if not pdf_doc:
     st.error(f"PDF file not found at path: {PDF_FILE}. Upload the PDF to the app folder or update PDF_FILE.")
     st.stop()
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
@@ -186,71 +182,4 @@ if prompt := st.chat_input("Ask about Warfarin protocols..."):
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        message_placeholder.markdown("Thinking...")
-
-        try:
-            # Ensure vector_store exists
-            if vector_store is None:
-                raise RuntimeError("Vector store not initialized. Re-run indexing or check PDF processing.")
-
-            results = vector_store.similarity_search_with_score(prompt, k=10)
-            docs = [doc for doc, score in results]
-
-            # Initialize model (wrapped in try/except to show clear errors)
-            try:
-                chat_model = get_chat_model()
-            except Exception as e:
-                message_placeholder.error("Model initialization error: " + str(e))
-                st.stop()
-
-            chain = load_qa_chain(chat_model, chain_type="stuff")
-
-            # --- PROMPT STRATEGY ---
-            p_header = (
-                "You are a clinical pharmacist assistant based ONLY on the provided protocol.\n\n"
-                "STRICT RULES:\n"
-                "1. Answer ONLY using the information in the CONTEXT.\n"
-                "2. The Context contains markers like [PAGE INDEX 12]. You MUST cite this number.\n"
-                "3. If the answer is not found, say \"The protocol does not contain this information.\"\n"
-            )
-
-            p_format = (
-                "RESPONSE FORMAT:\n"
-                "1. Direct Answer.\n"
-                "2. SOURCE: \"Reference found on Page Index [Insert Number Here]\"\n"
-            )
-
-            full_template = p_header + "\nCONTEXT: {context}\nUSER QUESTION: {question}\n" + p_format
-
-            PROMPT = PromptTemplate(template=full_template, input_variables=["context", "question"])
-            chain.llm_chain.prompt = PROMPT
-
-            response = chain.run(input_documents=docs, question=prompt)
-
-            # --- CITATION LOGIC ---
-            cited_page = extract_page_from_answer(response)
-
-            # Hallucination Check
-            show_image = True
-            lower_res = response.lower()
-            if "does not contain" in lower_res or "not found" in lower_res or "cannot provide" in lower_res:
-                show_image = False
-                cited_page = None
-
-            message_placeholder.markdown(response)
-
-            if show_image and cited_page is not None:
-                try:
-                    page = pdf_doc.load_page(cited_page)
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                    st.image(pix.tobytes("png"), caption=f"Source: Page {cited_page}", width=700)
-                    st.session_state.messages.append({"role": "assistant", "content": response, "image_page": cited_page})
-                except Exception:
-                    st.session_state.messages.append({"role": "assistant", "content": response, "image_page": None})
-            else:
-                st.session_state.messages.append({"role": "assistant", "content": response, "image_page": None})
-
-        except Exception as e:
-            message_placeholder.error(f"Error: {str(e)}")
+    with st.chat_message
