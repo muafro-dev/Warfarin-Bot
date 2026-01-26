@@ -52,7 +52,6 @@ def load_and_index_pdf(pdf_path):
 
     embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=api_key, transport="rest")
     
-    # Batch Processing to prevent 504 Errors
     vector_store = None
     batch_size = 5 
     total_docs = len(final_documents)
@@ -75,12 +74,52 @@ def load_and_index_pdf(pdf_path):
     my_bar.empty()
     return doc, vector_store
 
-# --- 3. MODEL SETUP (FIXED: Switched to Flash) ---
+# --- 3. DYNAMIC MODEL SELECTOR (SELF-HEALING) ---
 @st.cache_resource
 def get_chat_model():
-    # 'gemini-1.5-flash' is the most stable current model
+    """
+    Dynamically tests available models and selects the first one that works.
+    """
+    # Priority list: Newest/Fastest -> Oldest/Stable
+    candidate_models = [
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-pro",
+        "gemini-1.5-pro-latest",
+        "gemini-pro"
+    ]
+    
+    selected_model_name = None
+    
+    print("🔄 Testing Gemini Models...")
+    
+    for model_name in candidate_models:
+        try:
+            # Test the model with a tiny ping
+            test_llm = ChatGoogleGenerativeAI(
+                model=model_name, 
+                temperature=0.0, 
+                google_api_key=api_key, 
+                transport="rest"
+            )
+            # Invoke with a dummy string to check connectivity
+            test_llm.invoke("Hello")
+            
+            # If we get here, it worked!
+            selected_model_name = model_name
+            print(f"✅ Success! Connected to: {model_name}")
+            break
+        except Exception as e:
+            print(f"❌ Failed: {model_name} - Error: {str(e)}")
+            continue
+
+    if selected_model_name is None:
+        st.error("🚨 Critical Error: Could not connect to ANY Gemini models. Check your API Key or Quota.")
+        st.stop()
+
+    # Return the validated model
     return ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash", 
+        model=selected_model_name, 
         temperature=0.0, 
         google_api_key=api_key, 
         transport="rest"
@@ -88,7 +127,6 @@ def get_chat_model():
 
 # --- 4. CITATION EXTRACTOR ---
 def extract_page_from_answer(answer_text):
-    # Looks for "Page Index 31" or "Page 31" in the AI's own answer
     match = re.search(r"Page (?:Index )?(\d+)", answer_text, re.IGNORECASE)
     if match:
         return int(match.group(1))
@@ -96,7 +134,7 @@ def extract_page_from_answer(answer_text):
 
 # --- 5. UI & CHAT ---
 st.title(f"{ICON} {PAGE_TITLE}")
-st.caption("Local RAG · Hallucination-Safe · Citation-Based Retrieval")
+st.caption("Local RAG · Hallucination-Safe · Dynamic Model Selection")
 
 if "messages" not in st.session_state: st.session_state.messages = []
 
@@ -126,7 +164,7 @@ if prompt := st.chat_input("Ask about Warfarin protocols..."):
 
             chain = load_qa_chain(get_chat_model(), chain_type="stuff")
             
-            # --- THE PROMPT STRATEGY ---
+            # --- PROMPT STRATEGY ---
             custom_prompt = """
             You are a clinical pharmacist assistant based ONLY on the provided protocol.
             
@@ -136,38 +174,4 @@ if prompt := st.chat_input("Ask about Warfarin protocols..."):
             3. If the answer is not found, say "The protocol does not contain this information."
             
             CONTEXT: {context}
-            USER QUESTION: {question}
-            
-            RESPONSE FORMAT:
-            1. Direct Answer.
-            2. SOURCE: "Reference found on Page Index [Insert Number Here]"
-            """
-            
-            PROMPT = PromptTemplate(template=custom_prompt, input_variables=["context", "question"])
-            chain.llm_chain.prompt = PROMPT
-            response = chain.run(input_documents=docs, question=prompt)
-
-            # --- CITATION LOGIC ---
-            cited_page = extract_page_from_answer(response)
-            
-            # Hallucination Check
-            show_image = True
-            if "does not contain" in response.lower() or "not found" in response.lower():
-                show_image = False
-                cited_page = None 
-
-            message_placeholder.markdown(response)
-            
-            if show_image and cited_page is not None:
-                try:
-                    page = pdf_doc.load_page(cited_page) 
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                    st.image(pix.tobytes("png"), caption=f"Source: Page {cited_page}", width=700)
-                    st.session_state.messages.append({"role": "assistant", "content": response, "image_page": cited_page})
-                except:
-                    st.session_state.messages.append({"role": "assistant", "content": response, "image_page": None})
-            else:
-                st.session_state.messages.append({"role": "assistant", "content": response, "image_page": None})
-
-        except Exception as e:
-            message_placeholder.error(f"Error: {str(e)}")
+            USER QUESTION: {
