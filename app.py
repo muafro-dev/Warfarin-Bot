@@ -1,13 +1,13 @@
+# app.py
 import streamlit as st
 import os
 import fitz  # PyMuPDF
-import google.generativeai as genai
 import time
 import re
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple
 
-# --- MODERN LANGCHAIN IMPORTS ---
+# LangChain and helpers
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -16,48 +16,77 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+# Try to import the newer Google client if available
+# We will attempt to use google.genai first, then fall back to google.generativeai if present.
+try:
+    import google.genai as genai_new  # newer client (if installed)
+    GENAI_CLIENT = "genai_new"
+except Exception:
+    genai_new = None
+    GENAI_CLIENT = None
+
+try:
+    import google.generativeai as genai_old  # deprecated client (may still be installed)
+    if GENAI_CLIENT is None:
+        GENAI_CLIENT = "genai_old"
+except Exception:
+    genai_old = None
+    if GENAI_CLIENT is None:
+        GENAI_CLIENT = None
+
 # --- CONFIGURATION ---
 PAGE_TITLE = "Clinical Warfarin Bot"
-PDF_FILE = "Warfarin MTAC 2020.pdf" 
+PDF_FILE = "Warfarin MTAC 2020.pdf"
 ICON = "🩺"
 
 st.set_page_config(page_title=PAGE_TITLE, page_icon=ICON, layout="wide")
 
 # --- 1. SECURE API SETUP ---
+# Streamlit secrets: create .streamlit/secrets.toml with GOOGLE_API_KEY = "your_key"
 try:
     api_key = st.secrets["GOOGLE_API_KEY"]
-except FileNotFoundError:
-    st.error("Secrets file not found.")
-    st.stop()
 except Exception as e:
-    st.error(f"API Error: {e}")
+    st.error("Missing Google API key in Streamlit secrets. Add GOOGLE_API_KEY to .streamlit/secrets.toml.")
     st.stop()
+
+# If a supported genai client is available, configure it (best-effort)
+if GENAI_CLIENT == "genai_new":
+    try:
+        # configure new client (API differs by version; this is a safe best-effort)
+        genai_new.configure(api_key=api_key)
+    except Exception:
+        # not fatal here; model init will show clearer error later
+        pass
+elif GENAI_CLIENT == "genai_old":
+    try:
+        genai_old.configure(api_key=api_key)
+    except Exception:
+        pass
 
 # --- 2. LOGIC: PDF PROCESSING ---
 @st.cache_resource
 def load_and_index_pdf(pdf_path):
-    if not os.path.exists(pdf_path): return None, None
+    if not os.path.exists(pdf_path):
+        return None, None
     doc = fitz.open(pdf_path)
     raw_documents = []
-    
+
     # Inject Page Numbers
     for page_num, page in enumerate(doc):
         text = page.get_text()
         text_with_meta = f"[PAGE INDEX {page_num}]\n{text}"
         raw_documents.append(Document(page_content=text_with_meta, metadata={"page": page_num}))
-    
+
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
     final_documents = text_splitter.split_documents(raw_documents)
 
-    # Use standard embedding model
-    # Note: Removed transport='rest' to allow auto-negotiation
     embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/text-embedding-004", 
+        model="models/text-embedding-004",
         google_api_key=api_key
     )
-    
+
     vector_store = None
-    batch_size = 5 
+    batch_size = 5
     total_docs = len(final_documents)
     my_bar = st.progress(0, text="Initializing AI...")
 
@@ -69,7 +98,7 @@ def load_and_index_pdf(pdf_path):
                     vector_store = FAISS.from_documents(batch, embeddings)
                 else:
                     vector_store.add_documents(batch)
-                break 
+                break
             except Exception:
                 time.sleep(1)
         my_bar.progress(min((i + batch_size) / total_docs, 1.0))
@@ -78,16 +107,23 @@ def load_and_index_pdf(pdf_path):
     my_bar.empty()
     return doc, vector_store
 
-# --- 3. MODEL SETUP (SIMPLIFIED) ---
+# --- 3. MODEL SETUP (SAFE) ---
+# We will not crash on import; instead we try to initialize and show helpful errors.
 @st.cache_resource
-def get_chat_model():
-    # We remove the loop and the transport argument.
-    # This allows LangChain to use its default efficient connection method.
-    return ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash", 
-        temperature=0.0, 
-        google_api_key=api_key
-    )
+def get_chat_model(model_name="gemini-1.5-flash"):
+    try:
+        # Use LangChain wrapper; it will raise if model name or API is unsupported.
+        return ChatGoogleGenerativeAI(
+            model=model_name,
+            temperature=0.0,
+            google_api_key=api_key
+        )
+    except Exception as e:
+        # Re-raise with a clearer message for the UI
+        raise RuntimeError(
+            "Model initialization failed. This can happen if the model name is not supported "
+            "by your Google account or the client library. Original error: " + str(e)
+        ) from e
 
 # --- 4. CITATION EXTRACTOR ---
 def extract_page_from_answer(answer_text):
@@ -100,75 +136,118 @@ def extract_page_from_answer(answer_text):
 st.title(f"{ICON} {PAGE_TITLE}")
 st.caption("Local RAG · Hallucination-Safe · Citation-Based Retrieval")
 
-if "messages" not in st.session_state: st.session_state.messages = []
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Show a small diagnostics panel (non-sensitive)
+with st.expander("Diagnostics (click to expand)"):
+    st.write("GenAI client detected:", GENAI_CLIENT)
+    st.write("Model wrapper: langchain-google-genai ChatGoogleGenerativeAI")
+    st.write("PDF file path:", PDF_FILE)
+    st.write("If model initialization fails, use the 'List available models' button below to see supported model names.")
+
+    if st.button("List available models (best-effort)"):
+        # Try to list models using whichever client is available
+        try:
+            if GENAI_CLIENT == "genai_new":
+                models = genai_new.list_models()
+                st.write([m.name for m in models])
+            elif GENAI_CLIENT == "genai_old":
+                # older client may not have list_models; attempt best-effort
+                try:
+                    models = genai_old.list_models()
+                    st.write([m.name for m in models])
+                except Exception as e:
+                    st.write("Old client does not support list_models or call failed:", str(e))
+            else:
+                st.write("No Google GenAI client available in the environment.")
+        except Exception as e:
+            st.write("Listing models failed:", str(e))
 
 pdf_doc, vector_store = load_and_index_pdf(PDF_FILE)
-if not pdf_doc: st.stop()
+if not pdf_doc:
+    st.error(f"PDF file not found at path: {PDF_FILE}. Upload the PDF to the app folder or update PDF_FILE.")
+    st.stop()
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if "image_page" in message and message["image_page"] is not None:
             page_idx = message["image_page"]
-            page = pdf_doc.load_page(page_idx)
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            st.image(pix.tobytes("png"), caption=f"Source: Page {message['image_page']}", width=700)
+            try:
+                page = pdf_doc.load_page(page_idx)
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                st.image(pix.tobytes("png"), caption=f"Source: Page {message['image_page']}", width=700)
+            except Exception:
+                pass
 
 if prompt := st.chat_input("Ask about Warfarin protocols..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"): st.markdown(prompt)
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         message_placeholder.markdown("Thinking...")
-        
+
         try:
+            # Ensure vector_store exists
+            if vector_store is None:
+                raise RuntimeError("Vector store not initialized. Re-run indexing or check PDF processing.")
+
             results = vector_store.similarity_search_with_score(prompt, k=10)
             docs = [doc for doc, score in results]
 
-            chain = load_qa_chain(get_chat_model(), chain_type="stuff")
-            
-            # --- PROMPT STRATEGY (Split Strings to prevent Syntax Error) ---
-            p_header = """
-            You are a clinical pharmacist assistant based ONLY on the provided protocol.
-            
-            STRICT RULES:
-            1. Answer ONLY using the information in the CONTEXT.
-            2. The Context contains markers like [PAGE INDEX 12]. You MUST cite this number.
-            3. If the answer is not found, say "The protocol does not contain this information."
-            """
-            
-            p_format = """
-            RESPONSE FORMAT:
-            1. Direct Answer.
-            2. SOURCE: "Reference found on Page Index [Insert Number Here]"
-            """
-            
+            # Initialize model (wrapped in try/except to show clear errors)
+            try:
+                chat_model = get_chat_model()
+            except Exception as e:
+                message_placeholder.error("Model initialization error: " + str(e))
+                st.stop()
+
+            chain = load_qa_chain(chat_model, chain_type="stuff")
+
+            # --- PROMPT STRATEGY ---
+            p_header = (
+                "You are a clinical pharmacist assistant based ONLY on the provided protocol.\n\n"
+                "STRICT RULES:\n"
+                "1. Answer ONLY using the information in the CONTEXT.\n"
+                "2. The Context contains markers like [PAGE INDEX 12]. You MUST cite this number.\n"
+                "3. If the answer is not found, say \"The protocol does not contain this information.\"\n"
+            )
+
+            p_format = (
+                "RESPONSE FORMAT:\n"
+                "1. Direct Answer.\n"
+                "2. SOURCE: \"Reference found on Page Index [Insert Number Here]\"\n"
+            )
+
             full_template = p_header + "\nCONTEXT: {context}\nUSER QUESTION: {question}\n" + p_format
-            
+
             PROMPT = PromptTemplate(template=full_template, input_variables=["context", "question"])
             chain.llm_chain.prompt = PROMPT
+
             response = chain.run(input_documents=docs, question=prompt)
 
             # --- CITATION LOGIC ---
             cited_page = extract_page_from_answer(response)
-            
+
             # Hallucination Check
             show_image = True
             lower_res = response.lower()
             if "does not contain" in lower_res or "not found" in lower_res or "cannot provide" in lower_res:
                 show_image = False
-                cited_page = None 
+                cited_page = None
 
             message_placeholder.markdown(response)
-            
+
             if show_image and cited_page is not None:
                 try:
-                    page = pdf_doc.load_page(cited_page) 
+                    page = pdf_doc.load_page(cited_page)
                     pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
                     st.image(pix.tobytes("png"), caption=f"Source: Page {cited_page}", width=700)
                     st.session_state.messages.append({"role": "assistant", "content": response, "image_page": cited_page})
-                except:
+                except Exception:
                     st.session_state.messages.append({"role": "assistant", "content": response, "image_page": None})
             else:
                 st.session_state.messages.append({"role": "assistant", "content": response, "image_page": None})
