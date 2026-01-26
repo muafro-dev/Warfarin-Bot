@@ -26,7 +26,6 @@ st.set_page_config(page_title=PAGE_TITLE, page_icon=ICON, layout="wide")
 # --- 1. SECURE API SETUP ---
 try:
     api_key = st.secrets["GOOGLE_API_KEY"]
-    # Removed genai.configure to avoid conflicts with LangChain
 except FileNotFoundError:
     st.error("Secrets file not found.")
     st.stop()
@@ -51,6 +50,7 @@ def load_and_index_pdf(pdf_path):
     final_documents = text_splitter.split_documents(raw_documents)
 
     # Use standard embedding model
+    # Note: Removed transport='rest' to allow auto-negotiation
     embeddings = GoogleGenerativeAIEmbeddings(
         model="models/text-embedding-004", 
         google_api_key=api_key
@@ -78,13 +78,13 @@ def load_and_index_pdf(pdf_path):
     my_bar.empty()
     return doc, vector_store
 
-# --- 3. MODEL SETUP (STABLE CONFIGURATION) ---
+# --- 3. MODEL SETUP (SIMPLIFIED) ---
 @st.cache_resource
 def get_chat_model():
-    # We use the specific stable version requested
-    # We REMOVE transport='rest' to fix the 404 errors
+    # We remove the loop and the transport argument.
+    # This allows LangChain to use its default efficient connection method.
     return ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash-002", 
+        model="gemini-1.5-flash", 
         temperature=0.0, 
         google_api_key=api_key
     )
@@ -97,4 +97,81 @@ def extract_page_from_answer(answer_text):
     return None
 
 # --- 5. UI & CHAT ---
-st
+st.title(f"{ICON} {PAGE_TITLE}")
+st.caption("Local RAG · Hallucination-Safe · Citation-Based Retrieval")
+
+if "messages" not in st.session_state: st.session_state.messages = []
+
+pdf_doc, vector_store = load_and_index_pdf(PDF_FILE)
+if not pdf_doc: st.stop()
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        if "image_page" in message and message["image_page"] is not None:
+            page_idx = message["image_page"]
+            page = pdf_doc.load_page(page_idx)
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            st.image(pix.tobytes("png"), caption=f"Source: Page {message['image_page']}", width=700)
+
+if prompt := st.chat_input("Ask about Warfarin protocols..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"): st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+        message_placeholder.markdown("Thinking...")
+        
+        try:
+            results = vector_store.similarity_search_with_score(prompt, k=10)
+            docs = [doc for doc, score in results]
+
+            chain = load_qa_chain(get_chat_model(), chain_type="stuff")
+            
+            # --- PROMPT STRATEGY (Split Strings to prevent Syntax Error) ---
+            p_header = """
+            You are a clinical pharmacist assistant based ONLY on the provided protocol.
+            
+            STRICT RULES:
+            1. Answer ONLY using the information in the CONTEXT.
+            2. The Context contains markers like [PAGE INDEX 12]. You MUST cite this number.
+            3. If the answer is not found, say "The protocol does not contain this information."
+            """
+            
+            p_format = """
+            RESPONSE FORMAT:
+            1. Direct Answer.
+            2. SOURCE: "Reference found on Page Index [Insert Number Here]"
+            """
+            
+            full_template = p_header + "\nCONTEXT: {context}\nUSER QUESTION: {question}\n" + p_format
+            
+            PROMPT = PromptTemplate(template=full_template, input_variables=["context", "question"])
+            chain.llm_chain.prompt = PROMPT
+            response = chain.run(input_documents=docs, question=prompt)
+
+            # --- CITATION LOGIC ---
+            cited_page = extract_page_from_answer(response)
+            
+            # Hallucination Check
+            show_image = True
+            lower_res = response.lower()
+            if "does not contain" in lower_res or "not found" in lower_res or "cannot provide" in lower_res:
+                show_image = False
+                cited_page = None 
+
+            message_placeholder.markdown(response)
+            
+            if show_image and cited_page is not None:
+                try:
+                    page = pdf_doc.load_page(cited_page) 
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                    st.image(pix.tobytes("png"), caption=f"Source: Page {cited_page}", width=700)
+                    st.session_state.messages.append({"role": "assistant", "content": response, "image_page": cited_page})
+                except:
+                    st.session_state.messages.append({"role": "assistant", "content": response, "image_page": None})
+            else:
+                st.session_state.messages.append({"role": "assistant", "content": response, "image_page": None})
+
+        except Exception as e:
+            message_placeholder.error(f"Error: {str(e)}")
