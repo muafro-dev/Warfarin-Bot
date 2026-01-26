@@ -45,7 +45,7 @@ st.set_page_config(page_title=PAGE_TITLE, page_icon=ICON, layout="wide")
 # Streamlit secrets: create .streamlit/secrets.toml with GOOGLE_API_KEY = "your_key"
 try:
     api_key = st.secrets["GOOGLE_API_KEY"]
-except Exception as e:
+except Exception:
     st.error("Missing Google API key in Streamlit secrets. Add GOOGLE_API_KEY to .streamlit/secrets.toml.")
     st.stop()
 
@@ -182,4 +182,71 @@ if prompt := st.chat_input("Ask about Warfarin protocols..."):
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    with st.chat_message
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+        message_placeholder.markdown("Thinking...")
+
+        try:
+            # Ensure vector_store exists
+            if vector_store is None:
+                raise RuntimeError("Vector store not initialized. Re-run indexing or check PDF processing.")
+
+            results = vector_store.similarity_search_with_score(prompt, k=10)
+            docs = [doc for doc, score in results]
+
+            # Initialize model (wrapped in try/except to show clear errors)
+            try:
+                chat_model = get_chat_model(model_name=model_name)
+            except Exception as e:
+                message_placeholder.error("Model initialization error: " + str(e))
+                st.stop()
+
+            chain = load_qa_chain(chat_model, chain_type="stuff")
+
+            # --- PROMPT STRATEGY ---
+            p_header = (
+                "You are a clinical pharmacist assistant based ONLY on the provided protocol.\n\n"
+                "STRICT RULES:\n"
+                "1. Answer ONLY using the information in the CONTEXT.\n"
+                "2. The Context contains markers like [PAGE INDEX 12]. You MUST cite this number.\n"
+                "3. If the answer is not found, say \"The protocol does not contain this information.\"\n"
+            )
+
+            p_format = (
+                "RESPONSE FORMAT:\n"
+                "1. Direct Answer.\n"
+                "2. SOURCE: \"Reference found on Page Index [Insert Number Here]\"\n"
+            )
+
+            full_template = p_header + "\nCONTEXT: {context}\nUSER QUESTION: {question}\n" + p_format
+
+            PROMPT = PromptTemplate(template=full_template, input_variables=["context", "question"])
+            chain.llm_chain.prompt = PROMPT
+
+            response = chain.run(input_documents=docs, question=prompt)
+
+            # --- CITATION LOGIC ---
+            cited_page = extract_page_from_answer(response)
+
+            # Hallucination Check
+            show_image = True
+            lower_res = response.lower()
+            if "does not contain" in lower_res or "not found" in lower_res or "cannot provide" in lower_res:
+                show_image = False
+                cited_page = None
+
+            message_placeholder.markdown(response)
+
+            if show_image and cited_page is not None:
+                try:
+                    page = pdf_doc.load_page(cited_page)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                    st.image(pix.tobytes("png"), caption=f"Source: Page {cited_page}", width=700)
+                    st.session_state.messages.append({"role": "assistant", "content": response, "image_page": cited_page})
+                except Exception:
+                    st.session_state.messages.append({"role": "assistant", "content": response, "image_page": None})
+            else:
+                st.session_state.messages.append({"role": "assistant", "content": response, "image_page": None})
+
+        except Exception as e:
+            message_placeholder.error(f"Error: {str(e)}")
