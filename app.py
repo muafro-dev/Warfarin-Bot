@@ -174,4 +174,38 @@ if prompt := st.chat_input("Ask about Warfarin protocols..."):
             3. If the answer is not found, say "The protocol does not contain this information."
             
             CONTEXT: {context}
-            USER QUESTION: {
+            USER QUESTION: {question}
+            
+            RESPONSE FORMAT:
+            1. Direct Answer.
+            2. SOURCE: "Reference found on Page Index [Insert Number Here]"
+            """
+            
+            PROMPT = PromptTemplate(template=custom_prompt, input_variables=["context", "question"])
+            chain.llm_chain.prompt = PROMPT
+            response = chain.run(input_documents=docs, question=prompt)
+
+            # --- CITATION LOGIC ---
+            cited_page = extract_page_from_answer(response)
+            
+            # Hallucination Check
+            show_image = True
+            if "does not contain" in response.lower() or "not found" in response.lower():
+                show_image = False
+                cited_page = None 
+
+            message_placeholder.markdown(response)
+            
+            if show_image and cited_page is not None:
+                try:
+                    page = pdf_doc.load_page(cited_page) 
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                    st.image(pix.tobytes("png"), caption=f"Source: Page {cited_page}", width=700)
+                    st.session_state.messages.append({"role": "assistant", "content": response, "image_page": cited_page})
+                except:
+                    st.session_state.messages.append({"role": "assistant", "content": response, "image_page": None})
+            else:
+                st.session_state.messages.append({"role": "assistant", "content": response, "image_page": None})
+
+        except Exception as e:
+            message_placeholder.error(f"Error: {str(e)}")
