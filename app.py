@@ -17,16 +17,15 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # Try to import the newer Google client if available
-# We will attempt to use google.genai first, then fall back to google.generativeai if present.
 try:
-    import google.genai as genai_new  # newer client (if installed)
+    import google.genai as genai_new
     GENAI_CLIENT = "genai_new"
 except Exception:
     genai_new = None
     GENAI_CLIENT = None
 
 try:
-    import google.generativeai as genai_old  # deprecated client (may still be installed)
+    import google.generativeai as genai_old
     if GENAI_CLIENT is None:
         GENAI_CLIENT = "genai_old"
 except Exception:
@@ -42,14 +41,12 @@ ICON = "🩺"
 st.set_page_config(page_title=PAGE_TITLE, page_icon=ICON, layout="wide")
 
 # --- 1. SECURE API SETUP ---
-# Streamlit secrets: create .streamlit/secrets.toml with GOOGLE_API_KEY = "your_key"
 try:
     api_key = st.secrets["GOOGLE_API_KEY"]
 except Exception:
     st.error("Missing Google API key in Streamlit secrets. Add GOOGLE_API_KEY to .streamlit/secrets.toml.")
     st.stop()
 
-# If a supported genai client is available, configure it (best-effort)
 if GENAI_CLIENT == "genai_new":
     try:
         genai_new.configure(api_key=api_key)
@@ -69,7 +66,6 @@ def load_and_index_pdf(pdf_path):
     doc = fitz.open(pdf_path)
     raw_documents = []
 
-    # Inject Page Numbers
     for page_num, page in enumerate(doc):
         text = page.get_text()
         text_with_meta = f"[PAGE INDEX {page_num}]\n{text}"
@@ -116,8 +112,7 @@ def get_chat_model(model_name="gemini-1.5-flash"):
         )
     except Exception as e:
         raise RuntimeError(
-            "Model initialization failed. This can happen if the model name is not supported "
-            "by your Google account or the client library. Original error: " + str(e)
+            "Model initialization failed. Original error: " + str(e)
         ) from e
 
 # --- 4. CITATION EXTRACTOR ---
@@ -131,7 +126,6 @@ def extract_page_from_answer(answer_text):
 st.title(f"{ICON} {PAGE_TITLE}")
 st.caption("Local RAG · Hallucination-Safe · Citation-Based Retrieval")
 
-# Sidebar: model settings so you can try different model names without editing code
 st.sidebar.header("Model settings")
 model_name = st.sidebar.text_input("Model name", value="gemini-1.5-flash")
 
@@ -187,14 +181,12 @@ if prompt := st.chat_input("Ask about Warfarin protocols..."):
         message_placeholder.markdown("Thinking...")
 
         try:
-            # Ensure vector_store exists
             if vector_store is None:
                 raise RuntimeError("Vector store not initialized. Re-run indexing or check PDF processing.")
 
             results = vector_store.similarity_search_with_score(prompt, k=10)
             docs = [doc for doc, score in results]
 
-            # Initialize model (wrapped in try/except to show clear errors)
             try:
                 chat_model = get_chat_model(model_name=model_name)
             except Exception as e:
@@ -203,7 +195,6 @@ if prompt := st.chat_input("Ask about Warfarin protocols..."):
 
             chain = load_qa_chain(chat_model, chain_type="stuff")
 
-            # --- PROMPT STRATEGY ---
             p_header = (
                 "You are a clinical pharmacist assistant based ONLY on the provided protocol.\n\n"
                 "STRICT RULES:\n"
@@ -225,10 +216,8 @@ if prompt := st.chat_input("Ask about Warfarin protocols..."):
 
             response = chain.run(input_documents=docs, question=prompt)
 
-            # --- CITATION LOGIC ---
             cited_page = extract_page_from_answer(response)
 
-            # Hallucination Check
             show_image = True
             lower_res = response.lower()
             if "does not contain" in lower_res or "not found" in lower_res or "cannot provide" in lower_res:
