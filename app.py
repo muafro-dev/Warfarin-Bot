@@ -36,7 +36,7 @@ except Exception:
         GENAI_CLIENT = None
 
 # --- CONFIG ---
-PAGE_TITLE = "Clinical Warfarin Bot (Final)"
+PAGE_TITLE = "Clinical Warfarin Bot (Patched)"
 PDF_FILE = "Warfarin MTAC 2020.pdf"
 ICON = "🩺"
 
@@ -177,7 +177,7 @@ def extract_page_from_answer(answer_text: str) -> Optional[int]:
 
 # --- UI ---
 st.title(f"{ICON} {PAGE_TITLE}")
-st.caption("Final patched RAG: local PDF retrieval + optional Google GenAI (explicit context + robust fallbacks)")
+st.caption("Patched RAG: explicit context injection, strict prompt, deterministic model calls, and robust UI fallbacks")
 
 # Sidebar controls
 st.sidebar.header("Settings & Debug")
@@ -267,6 +267,21 @@ def choose_best_doc_for_snapshot(context_docs, query):
             best = d
     return best
 
+# Helper to detect reference-heavy pages (local fallback)
+def is_reference_page(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    # heuristics: many DOIs, "references" header, long list of citations
+    if t.count("doi:") >= 3:
+        return True
+    if "references" in t.splitlines()[0:5].join(" "):
+        return True
+    # pages that are mostly short citation lines (many years, journal names) - fallback heuristic
+    citation_indicators = ["doi:", "journal", "references", "et al.", "doi.org"]
+    hits = sum(1 for ind in citation_indicators if ind in t)
+    return hits >= 2
+
 # Render previous messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
@@ -300,11 +315,13 @@ if prompt := st.chat_input("Ask about Warfarin protocols..."):
                     score = sum(text.lower().count(tok) for tok in tokens)
                     scores.append((i, score))
                 scored = [s for s in scores if s[1] > 0]
+                # Filter out reference-only pages
+                scored = [(i, s) for i, s in scored if not is_reference_page(pages_texts[i])]
                 scored.sort(key=lambda x: x[1], reverse=True)
 
                 if debug_retriever:
                     st.sidebar.markdown("**DEBUG: Local fallback top pages**")
-                    for pidx, sc in scored[:6]:
+                    for pidx, sc in scored[:10]:
                         snippet = pages_texts[pidx][:300].replace("\n", " ")
                         st.sidebar.write(f"page={pidx} | score={sc} | snippet={snippet}")
 
@@ -350,8 +367,16 @@ if prompt := st.chat_input("Ask about Warfarin protocols..."):
                             snippet = d.get("page_content", "")[:300].replace("\n", " ")
                         st.sidebar.write(f"page={page_meta} | snippet={snippet}")
 
+                # Filter out reference-only docs from context_docs (so model sees clinical pages first)
+                filtered_docs = []
+                for d in top_docs:
+                    text = d.page_content if hasattr(d, "page_content") else d.get("page_content", "")
+                    if not is_reference_page(text):
+                        filtered_docs.append(d)
+                # If filtering removed everything, fall back to original top_docs
+                context_docs = filtered_docs[:20] if filtered_docs else top_docs[:20]
+
                 # Build explicit context from top docs (ensure page markers included)
-                context_docs = top_docs[:20]  # increased breadth
                 context = "\n\n".join((d.page_content if hasattr(d, "page_content") else d.get("page_content", "")) for d in context_docs)
 
                 if debug_context:
@@ -558,4 +583,4 @@ if st.button("Show page image"):
         st.error("Failed to render page: " + str(e))
 
 st.markdown("---")
-st.caption("This final build forces explicit context into the model and provides robust fallbacks so clinicians see protocol text even when the LLM path is flaky.")
+st.caption("This patched build forces explicit context into the model and provides robust fallbacks so clinicians see protocol text even when the LLM path is flaky.")
